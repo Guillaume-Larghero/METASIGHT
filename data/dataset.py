@@ -4,6 +4,8 @@ import torch
 from torch.utils.data import Dataset
 import os
 
+from .preprocessing import load_feature_file
+
 
 class WSIDataset(Dataset):
     """
@@ -54,7 +56,7 @@ class WSIDataset(Dataset):
                 feature_path = os.path.join(self.feature_path, f"{slide_id}.pt")
             
             if os.path.exists(feature_path):
-                features = torch.load(feature_path)
+                features = load_feature_file(feature_path)
             else:
                 features = None
         

@@ -23,23 +23,18 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import TrajectoryMILNet, get_loss_function
-from data import WSIDataset, collate_fn, load_trajectory_clinical_data, cross_fit_ipcw
+from data import (WSIDataset, collate_fn, load_trajectory_clinical_data, cross_fit_ipcw,
+                  load_feature_file, get_feature_dim, FEATURE_SUBDIR)
 from training import get_scheduler, step_scheduler
-from evaluation import compute_fold_aware_metrics
+from evaluation import aggregate_to_patient, patient_level_metrics, evaluate_per_cancer, format_ci
 
-# Foundation model dimensions
-FOUNDATION_MODELS = {
-    'CHIEF': 768,
-    'GIGAPATH': 1536,
-    'KEEP': 768,
-    'MUSK': 1024
-}
+PROB_COLS = ['pred_prob_class_0', 'pred_prob_class_1', 'pred_prob_class_2']
+METRICS = ('auroc', 'brier')
 
 # IPCW covariates for censoring model
 IPCW_COVARIATES = [
@@ -57,6 +52,10 @@ def parse_args():
                        choices=['CHIEF', 'GIGAPATH', 'KEEP', 'MUSK'])
     parser.add_argument("--slide_type", type=str, required=True,
                        choices=['FS', 'PM', 'MIX'])
+    parser.add_argument("--feature_level", type=str, default="patch",
+                       choices=['patch', 'slide'],
+                       help="patch: tile embeddings (CHIEF, GIGAPATH, KEEP, MUSK); "
+                            "slide: whole-slide encoder embedding (CHIEF, GIGAPATH)")
     
     # Training hyperparameters
     parser.add_argument("--batch_size", type=int, default=16)
@@ -100,7 +99,12 @@ def parse_args():
     parser.add_argument("--cancer_list", nargs="+", 
                        default=["BRCA", "LUAD", "KIRC"],
                        help="List of cancer types to train on")
-    parser.add_argument("--min_samples_per_cancer", type=int, default=30)
+    parser.add_argument("--min_samples_per_cancer", type=int, default=30,
+                       help="Minimum patients for a cancer type to be scored separately")
+    
+    # Evaluation
+    parser.add_argument("--n_bootstrap", type=int, default=1000,
+                       help="Patient-level bootstrap resamples for 95%% CIs")
     
     # Stratified CV
     parser.add_argument("--stratified_cv", action="store_true",
@@ -112,20 +116,22 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_features_for_cancer(cancer, foundation_model, slide_type, feature_root):
+def load_features_for_cancer(cancer, foundation_model, slide_type, feature_root,
+                             feature_level='patch'):
     """Load feature files for a single cancer type (supports both TCGA and non-TCGA formats)."""
     import glob
     
+    model_dir = FEATURE_SUBDIR[feature_level].format(fm=foundation_model)
     feature_paths = []
     # Try both TCGA-prefixed and non-prefixed paths for compatibility
     for prefix in [f'TCGA-{cancer}', cancer]:
         if slide_type == "MIX":
-            fs_path = f"{feature_root}{prefix}-FS/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
-            pm_path = f"{feature_root}{prefix}-PM/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
+            fs_path = f"{feature_root}{prefix}-FS/{model_dir}/20X/pt_files(stain_norm)/*.pt"
+            pm_path = f"{feature_root}{prefix}-PM/{model_dir}/20X/pt_files(stain_norm)/*.pt"
             feature_paths.extend(glob.glob(fs_path))
             feature_paths.extend(glob.glob(pm_path))
         else:
-            path = f"{feature_root}{prefix}-{slide_type}/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
+            path = f"{feature_root}{prefix}-{slide_type}/{model_dir}/20X/pt_files(stain_norm)/*.pt"
             feature_paths.extend(glob.glob(path))
     
     # Remove duplicates
@@ -134,7 +140,7 @@ def load_features_for_cancer(cancer, foundation_model, slide_type, feature_root)
     feature_dict = {}
     for fpath in feature_paths:
         slide_id = os.path.basename(fpath).replace('.pt', '')
-        feature_dict[slide_id] = torch.load(fpath)
+        feature_dict[slide_id] = load_feature_file(fpath)
     
     return feature_dict
 
@@ -266,11 +272,10 @@ def train_one_fold(model, train_loader, val_loader, optimizer, scheduler, loss_f
 
 
 def evaluate_fold(model, test_loader, device):
-    """Evaluate model on test set."""
+    """Slide-level class probabilities on the test set (metrics are computed per patient later)."""
     model.eval()
     test_preds = []
     test_labels = []
-    test_cancers = []
     
     with torch.no_grad():
         for batch in test_loader:
@@ -284,51 +289,8 @@ def evaluate_fold(model, test_loader, device):
             
             test_preds.append(probs)
             test_labels.extend(batch['tumor_event_label'].cpu().numpy())
-            
-            if 'cancer_types' in batch:
-                test_cancers.extend(batch['cancer_types'])
     
-    test_preds = np.vstack(test_preds)
-    test_labels = np.array(test_labels)
-    
-    # Compute metrics
-    metrics = {}
-    
-    # Multi-class AUROC (one-vs-rest)
-    try:
-        # Check if all classes are present in test set
-        unique_classes = np.unique(test_labels)
-        n_classes = test_preds.shape[1]
-        if len(unique_classes) == n_classes and all(np.sum(test_labels == c) >= 2 for c in unique_classes):
-            auroc_ovr = roc_auc_score(test_labels, test_preds, multi_class='ovr', average='macro')
-            metrics['auroc_macro'] = auroc_ovr
-        else:
-            metrics['auroc_macro'] = None
-    except (ValueError, RuntimeWarning):
-        metrics['auroc_macro'] = None
-    
-    # Per-class AUROC
-    n_classes = test_preds.shape[1]
-    for i in range(n_classes):
-        try:
-            binary_labels = (test_labels == i).astype(int)
-            if len(np.unique(binary_labels)) > 1:
-                auroc_i = roc_auc_score(binary_labels, test_preds[:, i])
-                metrics[f'auroc_class_{i}'] = auroc_i
-        except ValueError:
-            metrics[f'auroc_class_{i}'] = None
-    
-    # Brier score (multi-class)
-    try:
-        brier = 0
-        for i in range(n_classes):
-            binary_labels = (test_labels == i).astype(float)
-            brier += brier_score_loss(binary_labels, test_preds[:, i])
-        metrics['brier'] = brier / n_classes
-    except ValueError:
-        metrics['brier'] = None
-    
-    return test_preds, test_labels, test_cancers, metrics
+    return np.vstack(test_preds), np.array(test_labels)
 
 
 def main():
@@ -346,10 +308,10 @@ def main():
     # Setup
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    feature_len = FOUNDATION_MODELS[args.foundation_model]
+    feature_len = get_feature_dim(args.foundation_model, args.feature_level)
     
     print(f"METASIGHT - Future Trajectory Prediction Module")
-    print(f"Foundation Model: {args.foundation_model} ({feature_len}D)")
+    print(f"Foundation Model: {args.foundation_model} ({args.feature_level} level, {feature_len}D)")
     print(f"Slide Type: {args.slide_type}")
     print(f"Time Horizons: {args.cutoffs} days")
     print(f"Output: {args.output_dir}")
@@ -383,7 +345,8 @@ def main():
                 
                 # Load features
                 cancer_features = load_features_for_cancer(
-                    cancer, args.foundation_model, args.slide_type, args.feature_root
+                    cancer, args.foundation_model, args.slide_type, args.feature_root,
+                    args.feature_level
                 )
                 feature_dict.update(cancer_features)
                 
@@ -436,7 +399,7 @@ def main():
             res_df.loc[test_idx, 'fold'] = fold_idx
         
         # Train each fold
-        fold_results = []
+        fold_preds = []
         
         for fold_idx in range(args.fold_n):
             print(f"\nFold {fold_idx + 1}/{args.fold_n}")
@@ -507,15 +470,7 @@ def main():
             train_time = time.time() - start_time
             
             # Evaluate
-            test_preds, test_labels, test_cancers, metrics = evaluate_fold(
-                model, test_loader, device
-            )
-            
-            auroc_str = f"{metrics['auroc_macro']:.4f}" if metrics['auroc_macro'] is not None else "N/A"
-            brier_str = f"{metrics['brier']:.4f}" if metrics['brier'] is not None else "N/A"
-            print(f"Fold {fold_idx + 1}: AUROC={auroc_str}, Brier={brier_str}, Time={train_time:.1f}s")
-            
-            fold_results.append(metrics)
+            test_preds, test_labels = evaluate_fold(model, test_loader, device)
             
             # Save checkpoint
             checkpoint_dir = os.path.join(cutoff_dir, "checkpoints")
@@ -544,22 +499,40 @@ def main():
             if 'cancer_type' in test_df.columns:
                 pred_df['cancer_type'] = test_df['cancer_type'].values
             pred_df.to_csv(os.path.join(pred_dir, f"fold{fold_idx}_predictions.csv"), index=False)
+            fold_preds.append(pred_df)
+            
+            fold_res = patient_level_metrics(
+                aggregate_to_patient(pred_df, PROB_COLS), PROB_COLS, METRICS, n_boot=0
+            )
+            print(f"Fold {fold_idx + 1}: patient-level AUROC={format_ci(fold_res, 'auroc')}, "
+                  f"Brier={format_ci(fold_res, 'brier')} "
+                  f"({fold_res['n_patients']} patients), Time={train_time:.1f}s")
         
-        # Aggregate results
-        fold_aware_results = compute_fold_aware_metrics(
-            fold_results, metric_names=['auroc_macro', 'brier']
-        )
+        # Patient-level evaluation over all out-of-fold predictions
+        patient_df = aggregate_to_patient(pd.concat(fold_preds, ignore_index=True), PROB_COLS)
+        patient_df.to_csv(os.path.join(cutoff_dir, "patient_predictions.csv"), index=False)
+        
+        results = patient_level_metrics(patient_df, PROB_COLS, METRICS,
+                                        n_boot=args.n_bootstrap, seed=args.seed)
+        
+        if 'cancer_type' in patient_df.columns:
+            per_cancer = evaluate_per_cancer(patient_df, PROB_COLS, METRICS,
+                                             min_patients=args.min_samples_per_cancer,
+                                             n_boot=args.n_bootstrap, seed=args.seed)
+            per_cancer.to_csv(os.path.join(cutoff_dir, "per_cancer_metrics.csv"), index=False)
         
         result_summary = {
             "cancer": cancer_name,
             "cutoff_days": cutoff,
             "foundation_model": args.foundation_model,
+            "feature_level": args.feature_level,
             "slide_type": args.slide_type,
             "n_folds": args.fold_n,
-            "mean_auroc": fold_aware_results['auroc_macro_mean'],
-            "std_auroc": fold_aware_results['auroc_macro_std'],
-            "mean_brier": fold_aware_results['brier_mean'],
-            "std_brier": fold_aware_results['brier_std'],
+            "evaluation": (f"patient level (slide probabilities averaged per patient); AUROC = "
+                           f"mean of per-fold macro one-vs-rest AUROC, Brier = macro one-vs-rest, "
+                           f"pooled; 95% CI = percentile bootstrap, {args.n_bootstrap} resamples "
+                           f"of patients within folds"),
+            **results,
             "hyperparameters": vars(args)
         }
         
@@ -567,21 +540,10 @@ def main():
         with open(os.path.join(cutoff_dir, "results_summary.json"), 'w') as f:
             json.dump(result_summary, f, indent=2)
         
-        print(f"\n=== Results for {cutoff}-day horizon ===")
-        auroc_mean = fold_aware_results['auroc_macro_mean']
-        auroc_std = fold_aware_results['auroc_macro_std']
-        brier_mean = fold_aware_results['brier_mean']
-        brier_std = fold_aware_results['brier_std']
-        
-        if auroc_mean is not None:
-            auroc_str = f"{auroc_mean:.4f} ± {auroc_std:.4f}"
-        else:
-            auroc_str = "N/A (insufficient samples per class)"
-        
-        brier_str = f"{brier_mean:.4f} ± {brier_std:.4f}" if brier_mean is not None else "N/A"
-        
-        print(f"AUROC: {auroc_str}")
-        print(f"Brier: {brier_str}")
+        print(f"\n=== Results for {cutoff}-day horizon (patient level, "
+              f"{results['n_patients']} patients) ===")
+        print(f"AUROC: {format_ci(results, 'auroc')}")
+        print(f"Brier: {format_ci(results, 'brier')}")
     
     print(f"\nAll results saved to: {args.output_dir}")
 

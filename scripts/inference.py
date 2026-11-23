@@ -18,14 +18,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import MILNet, TrajectoryMILNet
-
-# Foundation model dimensions
-FOUNDATION_MODELS = {
-    'CHIEF': 768,
-    'GIGAPATH': 1536,
-    'KEEP': 768,
-    'MUSK': 1024
-}
+from data import load_feature_file, get_feature_dim
+from evaluation import aggregate_to_patient, patient_level_metrics, evaluate_per_cancer, format_ci
 
 
 def parse_args():
@@ -38,6 +32,9 @@ def parse_args():
     parser.add_argument("--module", type=str, required=True,
                        choices=['status', 'trajectory'],
                        help="Prediction module: status (binary) or trajectory (multi-class)")
+    parser.add_argument("--feature_level", type=str, default=None,
+                       choices=['patch', 'slide'],
+                       help="Feature level of the inputs; defaults to the level stored in the checkpoint")
     
     # Input data
     parser.add_argument("--feature_file", type=str, default=None,
@@ -53,6 +50,14 @@ def parse_args():
     parser.add_argument("--output_format", type=str, default="csv",
                        choices=['csv', 'json'],
                        help="Output format")
+    
+    # Optional patient-level evaluation
+    parser.add_argument("--label_csv", type=str, default=None,
+                       help="CSV with slide_id, patient_id, true_label (optional cancer_type); "
+                            "if given, predictions are averaged per patient and scored with 95%% CIs")
+    parser.add_argument("--n_bootstrap", type=int, default=1000,
+                       help="Patient-level bootstrap resamples for 95%% CIs")
+    parser.add_argument("--min_patients_per_cancer", type=int, default=30)
     
     # Device
     parser.add_argument("--device", type=str, default="cuda",
@@ -78,14 +83,17 @@ def load_checkpoint(checkpoint_path):
     return checkpoint, hparams
 
 
-def load_model(checkpoint, module, device):
+def load_model(checkpoint, module, device, feature_level=None):
     """Initialize model and load weights from checkpoint."""
     hparams = checkpoint.get('hyperparameters', {})
     
     # Get foundation model info
     foundation_model = checkpoint.get('foundation_model', 
                                       hparams.get('foundation_model', 'CHIEF'))
-    feature_dim = FOUNDATION_MODELS[foundation_model]
+    feature_level = feature_level or hparams.get('feature_level', 'patch')
+    feature_dim = get_feature_dim(foundation_model, feature_level)
+    # Training disables batch norm for folds with < 16 training slides
+    use_batchnorm = any(k.endswith('running_mean') for k in checkpoint['model_state_dict'])
     
     # Initialize model based on module type
     if module == 'status':
@@ -94,7 +102,7 @@ def load_model(checkpoint, module, device):
             n_output=2,
             hidden_dim=hparams.get('hidden_dim', 128),
             dropout=hparams.get('dropout', 0.3),
-            use_batchnorm=True
+            use_batchnorm=use_batchnorm
         )
     else:  # trajectory
         model = TrajectoryMILNet(
@@ -102,7 +110,7 @@ def load_model(checkpoint, module, device):
             n_classes=3,
             hidden_dim=hparams.get('hidden_dim', 128),
             dropout=hparams.get('dropout', 0.2),
-            use_batchnorm=True
+            use_batchnorm=use_batchnorm
         )
     
     # Load weights
@@ -110,19 +118,16 @@ def load_model(checkpoint, module, device):
     model = model.to(device)
     model.eval()
     
-    return model, foundation_model
+    return model, foundation_model, feature_level, feature_dim
 
 
-def load_features(feature_path):
-    """Load feature tensor from file."""
-    features = torch.load(feature_path)
+def load_features(feature_path, feature_dim):
+    """Load feature tensor from file: [n_patches, dim] (patch) or [1, dim] (slide)."""
+    features = load_feature_file(feature_path)
     
-    # Validate
-    if not isinstance(features, torch.Tensor):
-        raise ValueError(f"Feature file must contain a tensor, got {type(features)}")
-    
-    if len(features.shape) != 2:
-        raise ValueError(f"Expected 2D tensor [n_patches, dim], got shape {features.shape}")
+    if features.dim() != 2 or features.shape[1] != feature_dim:
+        raise ValueError(f"Expected 2D tensor [n_instances, {feature_dim}], got shape "
+                         f"{tuple(features.shape)}")
     
     return features
 
@@ -162,8 +167,11 @@ def run_inference(args):
     # Load checkpoint and model
     print(f"Loading checkpoint: {args.checkpoint}")
     checkpoint, hparams = load_checkpoint(args.checkpoint)
-    model, foundation_model = load_model(checkpoint, args.module, args.device)
-    print(f"Model loaded: {args.module} module, {foundation_model} features")
+    model, foundation_model, feature_level, feature_dim = load_model(
+        checkpoint, args.module, args.device, args.feature_level
+    )
+    print(f"Model loaded: {args.module} module, {foundation_model} {feature_level}-level "
+          f"features ({feature_dim}D)")
     
     # Collect feature files to process
     feature_files = []
@@ -211,7 +219,7 @@ def run_inference(args):
         
         try:
             # Load features
-            features = load_features(fpath)
+            features = load_features(fpath, feature_dim)
             
             # Run prediction
             prediction = predict_single(model, features, args.device, args.module)
@@ -233,7 +241,7 @@ def run_inference(args):
     print(f"Successfully processed {len(results)}/{len(feature_files)} slides")
     
     # Save results
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output_file) or '.', exist_ok=True)
     
     if args.output_format == 'csv':
         results_df = pd.DataFrame(results)
@@ -261,6 +269,51 @@ def run_inference(args):
         labels = ['No event', 'Locoregional recurrence', 'Distant metastasis']
         for cls, count in pred_counts.items():
             print(f"  {labels[cls]}: {count} ({100*count/len(results_df):.1f}%)")
+    
+    if args.label_csv is not None:
+        evaluate_patient_level(results_df, args)
+
+
+def evaluate_patient_level(results_df, args):
+    """Average slide predictions per patient and score them with bootstrap 95% CIs."""
+    labels_df = pd.read_csv(args.label_csv)
+    missing = {'slide_id', 'patient_id', 'true_label'} - set(labels_df.columns)
+    if missing:
+        raise ValueError(f"--label_csv is missing columns: {sorted(missing)}")
+    
+    if args.module == 'status':
+        prob_cols, metrics = ['prob_metastasis'], ('auroc', 'auprc', 'brier')
+    else:
+        prob_cols, metrics = ['prob_no_event', 'prob_locoregional', 'prob_metastasis'], ('auroc', 'brier')
+    
+    keep = [c for c in ('slide_id', 'patient_id', 'true_label', 'cancer_type') if c in labels_df.columns]
+    merged = results_df.merge(labels_df[keep].astype({'slide_id': str}),
+                              on='slide_id', how='inner')
+    print(f"\n=== Patient-level evaluation ({len(merged)}/{len(results_df)} slides with labels) ===")
+    if merged.empty:
+        return
+    
+    patient_df = aggregate_to_patient(merged, prob_cols)
+    stem = os.path.splitext(args.output_file)[0]
+    patient_df.to_csv(f"{stem}_patient_predictions.csv", index=False)
+    
+    res = patient_level_metrics(patient_df, prob_cols, metrics, n_boot=args.n_bootstrap)
+    print(f"Patients: {res['n_patients']}")
+    for m in metrics:
+        print(f"{m.upper()}: {format_ci(res, m)}")
+    
+    summary = {'module': args.module,
+               'evaluation': (f"patient level (slide probabilities averaged per patient); "
+                              f"95% CI = percentile bootstrap, {args.n_bootstrap} resamples of patients"),
+               **res}
+    if 'cancer_type' in patient_df.columns:
+        per_cancer = evaluate_per_cancer(patient_df, prob_cols, metrics,
+                                         min_patients=args.min_patients_per_cancer,
+                                         n_boot=args.n_bootstrap)
+        per_cancer.to_csv(f"{stem}_per_cancer_metrics.csv", index=False)
+    with open(f"{stem}_patient_metrics.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"Patient-level results saved with prefix: {stem}_")
 
 
 def main():

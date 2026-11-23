@@ -1,6 +1,7 @@
 """Evaluation metrics and utilities."""
 
-from .metrics import compute_fold_aware_metrics, evaluate_per_cancer
+from .metrics import (aggregate_to_patient, patient_level_metrics, evaluate_per_cancer,
+                      auroc_score, auprc_score, brier_score, format_ci)
 
-__all__ = ['compute_fold_aware_metrics', 'evaluate_per_cancer']
-
+__all__ = ['aggregate_to_patient', 'patient_level_metrics', 'evaluate_per_cancer',
+           'auroc_score', 'auprc_score', 'brier_score', 'format_ci']

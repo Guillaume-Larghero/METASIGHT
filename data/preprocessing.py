@@ -6,7 +6,40 @@ import os
 import pandas as pd
 
 
-def load_features(cancer, foundation_model, slide_type, feature_root):
+# Feature dimension per foundation model and feature level.
+# patch: tile embeddings [n_patches, dim]; slide: whole-slide encoder embedding [1, dim].
+FEATURE_DIMS = {
+    'patch': {'CHIEF': 768, 'GIGAPATH': 1536, 'KEEP': 768, 'MUSK': 1024},
+    'slide': {'CHIEF': 768, 'GIGAPATH': 768},
+}
+
+# Model sub-directory under each cohort folder, per feature level.
+FEATURE_SUBDIR = {
+    'patch': '{fm}',
+    'slide': '{fm}_WSI',
+}
+
+
+def get_feature_dim(foundation_model, feature_level='patch'):
+    """Feature dimension of `foundation_model` at `feature_level` ('patch' | 'slide')."""
+    if feature_level not in FEATURE_DIMS:
+        raise ValueError(f"feature_level must be one of {list(FEATURE_DIMS)}, got {feature_level!r}")
+    dims = FEATURE_DIMS[feature_level]
+    if foundation_model not in dims:
+        raise ValueError(f"{foundation_model} has no {feature_level}-level features; "
+                         f"available: {list(dims)}")
+    return dims[foundation_model]
+
+
+def load_feature_file(path):
+    """Load one .pt feature file as a detached 2D tensor [n_instances, dim]."""
+    tensor = torch.load(path, map_location='cpu').detach()
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
+def load_features(cancer, foundation_model, slide_type, feature_root, feature_level='patch'):
     """
     Load foundation model features for a single cancer type.
     
@@ -15,33 +48,36 @@ def load_features(cancer, foundation_model, slide_type, feature_root):
         foundation_model: Foundation model name (e.g., 'CHIEF')
         slide_type: 'FS' | 'PM' | 'MIX'
         feature_root: Root directory for features
+        feature_level: 'patch' (tile embeddings) | 'slide' (whole-slide embedding)
     
     Returns:
         feature_dict: {slide_id: tensor}
-        max_len: Maximum number of patches across slides
+        max_len: Maximum number of patches across slides (1 for slide level)
     """
     mag = '20X'
+    get_feature_dim(foundation_model, feature_level)
+    model_dir = FEATURE_SUBDIR[feature_level].format(fm=foundation_model)
     
     # Try with TCGA prefix first, then without (for custom datasets)
     if slide_type == "MIX":
         # Try TCGA paths first
-        fs_path = f"{feature_root}TCGA-{cancer}-FS/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
-        pm_path = f"{feature_root}TCGA-{cancer}-PM/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
+        fs_path = f"{feature_root}TCGA-{cancer}-FS/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
+        pm_path = f"{feature_root}TCGA-{cancer}-PM/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
         feature_paths = glob.glob(fs_path) + glob.glob(pm_path)
         
         # If no TCGA paths found, try without prefix
         if not feature_paths:
-            fs_path = f"{feature_root}{cancer}-FS/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
-            pm_path = f"{feature_root}{cancer}-PM/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
+            fs_path = f"{feature_root}{cancer}-FS/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
+            pm_path = f"{feature_root}{cancer}-PM/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
             feature_paths = glob.glob(fs_path) + glob.glob(pm_path)
     else:
         # Try TCGA path first
-        path = f"{feature_root}TCGA-{cancer}-{slide_type}/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
+        path = f"{feature_root}TCGA-{cancer}-{slide_type}/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
         feature_paths = glob.glob(path)
         
         # If no TCGA path found, try without prefix
         if not feature_paths:
-            path = f"{feature_root}{cancer}-{slide_type}/{foundation_model}/{mag}/pt_files(stain_norm)/*.pt"
+            path = f"{feature_root}{cancer}-{slide_type}/{model_dir}/{mag}/pt_files(stain_norm)/*.pt"
             feature_paths = glob.glob(path)
     
     feature_dict = {}
@@ -49,14 +85,15 @@ def load_features(cancer, foundation_model, slide_type, feature_root):
     
     for path in feature_paths:
         slide_id = os.path.basename(path).replace('.pt', '')
-        tensor = torch.load(path)
+        tensor = load_feature_file(path)
         feature_dict[slide_id] = tensor
         max_len = max(max_len, tensor.shape[0])
     
     return feature_dict, max_len
 
 
-def load_pooled_features(cancer_list, foundation_model, slide_type, feature_root):
+def load_pooled_features(cancer_list, foundation_model, slide_type, feature_root,
+                         feature_level='patch'):
     """
     Load foundation model features for multiple cancer types (pooled mode).
     
@@ -65,6 +102,7 @@ def load_pooled_features(cancer_list, foundation_model, slide_type, feature_root
         foundation_model: Foundation model name
         slide_type: Slide type
         feature_root: Root directory for features
+        feature_level: 'patch' | 'slide'
     
     Returns:
         feature_dict: Combined dictionary for all cancers
@@ -75,7 +113,7 @@ def load_pooled_features(cancer_list, foundation_model, slide_type, feature_root
     
     for cancer in cancer_list:
         cancer_features, cancer_max_len = load_features(
-            cancer, foundation_model, slide_type, feature_root
+            cancer, foundation_model, slide_type, feature_root, feature_level
         )
         feature_dict.update(cancer_features)
         max_len = max(max_len, cancer_max_len)

@@ -83,7 +83,7 @@
 
 **Performance breakdown:** 
 - **Metastatic status (M0 vs M1):** METASIGHT ensembles reached AUROC 0.801 (slide-level) and 0.793 (patch-level) in the TCGA development cohort and maintained AUROC ≥0.79 across all external cohorts (peak 0.876, PLCO). Ensembling improved the mean AUROC from 0.736 for the best individual foundation model to 0.830 (ΔAUROC +0.094; paired Wilcoxon P = 2.4×10⁻⁴), matching or exceeding the best individual model in 77 of 79 cohort–cancer comparisons.
-- **Future trajectory (1-, 2-, 3-year):** METASIGHT ensembles reached mean AUROC 0.882, 0.892, and 0.903 at the 1-, 2-, and 3-year horizons, versus 0.825, 0.823, and 0.822 for the best individual foundation models (ΔAUROC +0.057/+0.070/+0.081; paired Wilcoxon P = 0.028), with improvements reproduced in external cohorts (e.g., DFCI, HANCOCK).
+- **Future trajectory (1-, 2-, 3-year):** METASIGHT ensembles reached mean AUROC 0.882, 0.892, and 0.903 at the 1-, 2-, and 3-year horizons, versus 0.825, 0.823, and 0.822 for the best individual foundation models (ΔAUROC +0.057/+0.070/+0.081; paired Wilcoxon P = 0.028), with improvements reproduced in external cohorts (e.g., DFCI, HANCOCK, HKU).
 - **Calibration:** Ensembling lowered the mean Brier score from 0.111 to 0.085 (status) and from 0.064/0.091/0.108 to 0.049/0.063/0.070 across the 1-, 2-, and 3-year horizons (trajectory).
 - **Clinical utility:** Decision-curve analysis showed positive net benefit over treat-all and treat-none strategies at all evaluated risk thresholds in internal and external cohorts, and the ensemble yielded consistently positive continuous net reclassification improvement (NRI) relative to individual foundation models.
 

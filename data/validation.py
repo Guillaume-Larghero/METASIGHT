@@ -12,14 +12,7 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 
-
-# Foundation model expected dimensions
-FOUNDATION_MODEL_DIMS = {
-    'CHIEF': 768,
-    'GIGAPATH': 1536,
-    'KEEP': 768,
-    'MUSK': 1024
-}
+from .preprocessing import FEATURE_SUBDIR, get_feature_dim, load_feature_file
 
 # Minimum sample sizes per cancer for reliable evaluation
 MIN_SAMPLES_PER_CANCER = {
@@ -49,10 +42,7 @@ def validate_feature_dimension(feature_path: str, expected_dim: int,
         Tuple of (is_valid, error_message)
     """
     try:
-        features = torch.load(feature_path)
-        
-        if not isinstance(features, torch.Tensor):
-            return False, f"Feature file is not a tensor: {type(features)}"
+        features = load_feature_file(feature_path)
         
         if len(features.shape) != 2:
             return False, f"Expected 2D tensor [n_patches, dim], got shape {features.shape}"
@@ -79,7 +69,8 @@ def validate_feature_dimension(feature_path: str, expected_dim: int,
 
 
 def validate_feature_directory(cancer: str, foundation_model: str, slide_type: str,
-                               feature_root: str, verbose: bool = True) -> Dict:
+                               feature_root: str, verbose: bool = True,
+                               feature_level: str = 'patch') -> Dict:
     """
     Validate all feature files for a cancer type.
     
@@ -89,24 +80,24 @@ def validate_feature_directory(cancer: str, foundation_model: str, slide_type: s
         slide_type: 'FS', 'PM', or 'MIX'
         feature_root: Root directory for features
         verbose: Print detailed validation results
+        feature_level: 'patch' | 'slide'
     
     Returns:
         Dictionary with validation results
     """
-    expected_dim = FOUNDATION_MODEL_DIMS.get(foundation_model)
-    if expected_dim is None:
-        raise ValueError(f"Unknown foundation model: {foundation_model}")
+    expected_dim = get_feature_dim(foundation_model, feature_level)
+    model_dir = FEATURE_SUBDIR[feature_level].format(fm=foundation_model)
     
     # Build file paths - try both with and without TCGA prefix for compatibility
     feature_paths = []
     for prefix in [f'TCGA-{cancer}', cancer]:
         if slide_type == "MIX":
-            fs_path = f"{feature_root}{prefix}-FS/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
-            pm_path = f"{feature_root}{prefix}-PM/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
+            fs_path = f"{feature_root}{prefix}-FS/{model_dir}/20X/pt_files(stain_norm)/*.pt"
+            pm_path = f"{feature_root}{prefix}-PM/{model_dir}/20X/pt_files(stain_norm)/*.pt"
             feature_paths.extend(glob.glob(fs_path))
             feature_paths.extend(glob.glob(pm_path))
         else:
-            path = f"{feature_root}{prefix}-{slide_type}/{foundation_model}/20X/pt_files(stain_norm)/*.pt"
+            path = f"{feature_root}{prefix}-{slide_type}/{model_dir}/20X/pt_files(stain_norm)/*.pt"
             feature_paths.extend(glob.glob(path))
     
     # Remove duplicates
@@ -320,7 +311,8 @@ def validate_features_match_clinical(feature_dict: Dict, clinical_df: pd.DataFra
 
 def validate_dataset_for_training(cancer: str, foundation_model: str, slide_type: str,
                                   feature_root: str, clinical_root: str, label_file: str,
-                                  task: str = 'status', verbose: bool = True) -> bool:
+                                  task: str = 'status', verbose: bool = True,
+                                  feature_level: str = 'patch') -> bool:
     """
     Comprehensive validation of dataset before training.
     
@@ -333,6 +325,7 @@ def validate_dataset_for_training(cancer: str, foundation_model: str, slide_type
         label_file: Path to label file
         task: 'status' or 'trajectory'
         verbose: Print detailed results
+        feature_level: 'patch' | 'slide'
     
     Returns:
         True if all validations pass, False otherwise
@@ -348,7 +341,7 @@ def validate_dataset_for_training(cancer: str, foundation_model: str, slide_type
     # 1. Validate feature files
     try:
         feature_results = validate_feature_directory(
-            cancer, foundation_model, slide_type, feature_root, verbose
+            cancer, foundation_model, slide_type, feature_root, verbose, feature_level
         )
         if feature_results['n_invalid'] > 0:
             all_valid = False
@@ -427,6 +420,7 @@ if __name__ == "__main__":
     parser.add_argument("--cancer", type=str, required=True)
     parser.add_argument("--foundation_model", type=str, default="CHIEF")
     parser.add_argument("--slide_type", type=str, default="FS")
+    parser.add_argument("--feature_level", type=str, default="patch", choices=['patch', 'slide'])
     parser.add_argument("--task", type=str, default="status", choices=['status', 'trajectory'])
     parser.add_argument("--feature_root", type=str, 
                        default="/path/to/foundation_model_features/WSI_features/")
@@ -440,6 +434,6 @@ if __name__ == "__main__":
     validate_dataset_for_training(
         args.cancer, args.foundation_model, args.slide_type,
         args.feature_root, args.clinical_root, args.label_file,
-        args.task, verbose=True
+        args.task, verbose=True, feature_level=args.feature_level
     )
 
